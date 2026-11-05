@@ -6,6 +6,13 @@ use std::{borrow::Cow, sync::OnceLock};
 
 #[cfg(target_feature = "avx2")]
 pub mod avx;
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "ssse3",
+    target_feature = "sse4.1",
+    not(target_feature = "avx2")
+))]
+pub mod sse;
 mod dummy_cuda;
 mod dummy_metal;
 pub mod ggml_file;
