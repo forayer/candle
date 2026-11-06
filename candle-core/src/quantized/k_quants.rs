@@ -2030,6 +2030,14 @@ impl GgmlType for BlockQ6K {
             return unsafe { super::avx::vec_dot_q6k_q8k(n, xs, ys) };
         }
 
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "ssse3",
+            target_feature = "sse4.1",
+            not(target_feature = "avx2")
+        ))]
+        return super::sse::vec_dot_q6k_q8k(n, xs, ys);
+
         #[cfg(target_feature = "neon")]
         return super::neon::vec_dot_q6k_q8k(n, xs, ys);
 
