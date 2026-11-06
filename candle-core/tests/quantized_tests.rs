@@ -1714,6 +1714,68 @@ fn qmatmul_batched_rows_match_single_row_cpu() -> Result<()> {
     Ok(())
 }
 
+// `matmul_f16` (used whenever a model's hidden states stay f16, e.g. GGUF `general.dtype == 1`)
+// parallelizes across `barrier_pool` the same way `matmul` does for f32 lhs/dst. This exercises
+// both the m==1 decode fast path (including Q6K's `execute_static` branch) and the row-tiled
+// m>1 prefill path, across `n` values that land on every possible tail size (n_tail 0..=3), and
+// cross-checks against an f32 lhs/dst run of the same inputs/weights for numerical correctness
+// in addition to batched-vs-single-row self-consistency.
+#[test]
+fn matmul_f16_batched_rows_match_single_row_and_f32_cpu() -> Result<()> {
+    let dev = Device::Cpu;
+    for dtype in [GgmlDType::Q6K, GgmlDType::Q4K, GgmlDType::Q8_0] {
+        for k in [256usize] {
+            // n values covering n_tail = 0, 1, 2, 3 once n is reduced mod 4.
+            for n in [64usize, 65, 66, 67] {
+                let w = Tensor::rand(-1f32, 1f32, (n, k), &dev)?;
+                let qtensor = quantized::QTensor::quantize(&w, dtype)?;
+                // m=1 exercises the decode fast path, m=15/16/17 straddles
+                // `MATMUL_ROW_TILE` (16), m=33 covers more than two tiles.
+                for m in [1usize, 2, 15, 16, 17, 33] {
+                    let lhs_f32 = Tensor::rand(-1f32, 1f32, (m, k), &dev)?;
+                    let lhs_f16 = lhs_f32.to_dtype(DType::F16)?;
+
+                    let batched_f16 = lhs_f16
+                        .apply_op1_no_bwd(&qtensor)?
+                        .to_dtype(DType::F32)?
+                        .to_vec2::<f32>()?;
+                    let reference_f32 =
+                        lhs_f32.apply_op1_no_bwd(&qtensor)?.to_vec2::<f32>()?;
+
+                    #[allow(clippy::needless_range_loop)] // row_idx is also used for `narrow`
+                    for row_idx in 0..m {
+                        let row = lhs_f16.narrow(0, row_idx, 1)?;
+                        let single = row
+                            .apply_op1_no_bwd(&qtensor)?
+                            .to_dtype(DType::F32)?
+                            .to_vec2::<f32>()?;
+                        assert_eq!(
+                            &batched_f16[row_idx], &single[0],
+                            "{dtype:?} m={m} n={n}: row {row_idx} differs from the single-row result"
+                        );
+                    }
+
+                    let diff = batched_f16
+                        .iter()
+                        .flatten()
+                        .zip(reference_f32.iter().flatten())
+                        .fold(0f32, |acc, (a, b)| acc.max((a - b).abs()));
+                    let scale = reference_f32
+                        .iter()
+                        .flatten()
+                        .fold(1f32, |acc, v| acc.max(v.abs()));
+                    assert!(
+                        diff / scale < 5e-2,
+                        "{dtype:?} m={m} n={n}: rel diff {} too large vs f32 reference",
+                        diff / scale
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // `k_quants::matmul` is a safe fn that writes `dst` through a raw pointer from the pool threads, so
 // an undersized `dst` has to be rejected up front rather than written out of bounds.
 #[test]
