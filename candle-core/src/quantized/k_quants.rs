@@ -2683,39 +2683,178 @@ pub(crate) fn matmul_q4k_x8(
     })
 }
 
+// Parallel, barrier_pool-backed counterpart of `matmul` for f16 activations (e.g. models whose
+// GGUF `general.dtype` is F16, which keeps hidden states in f16 throughout the forward pass).
+// Mirrors `matmul`'s row-tiled / decode-fast-path structure exactly; the only differences are
+// the extra f16->f32 widening of `lhs` before quantizing it into `T::VecDotType`, and the
+// f32->f16 narrowing of each dot-product result before it's written to `dst`.
 pub fn matmul_f16<T: GgmlType>(
-    mkn: (usize, usize, usize),
+    (m, k, n): (usize, usize, usize),
     lhs: &[f16],
     rhs_t: &[T],
     dst: &mut [f16],
 ) -> Result<()> {
-    let (m, k, n) = mkn;
-    if m * k != lhs.len() {
-        crate::bail!("unexpected lhs length {} {mkn:?}", lhs.len());
+    debug_assert_eq!(
+        T::BLCK_SIZE,
+        T::VecDotType::BLCK_SIZE,
+        "Mismatched block sizes"
+    );
+    // Real asserts rather than debug ones: the workers below write `dst` through a raw pointer,
+    // so an undersized `dst` would otherwise be written out of bounds instead of panicking.
+    assert_eq!(
+        m * k,
+        lhs.len(),
+        "unexpected lhs length {} ({m},{k},{n})",
+        lhs.len()
+    );
+    assert!(
+        dst.len() >= m * n,
+        "dst too small: {} < {}",
+        dst.len(),
+        m * n
+    );
+    let k_in_blocks = k.div_ceil(T::BLCK_SIZE);
+
+    // Thread-local scratch buffers reused across calls to avoid per-matmul heap allocation:
+    // one for the f32-widened lhs row (max `k` elements), one for the quantized lhs
+    // (`T::VecDotType` blocks, same role as `matmul`'s `LHS_SCRATCH`).
+    thread_local! {
+        static LHS_F32_SCRATCH: std::cell::RefCell<Vec<f32>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        static LHS_SCRATCH: std::cell::RefCell<Vec<u64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    let k_in_lhs_blocks = k.div_ceil(T::BLCK_SIZE);
-    let k_in_rhs_blocks = k.div_ceil(T::VecDotType::BLCK_SIZE);
-    let mut lhs_b = vec![T::VecDotType::zeros(); m * k_in_lhs_blocks];
-    for row_idx in 0..m {
-        let lhs_b = &mut lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
-        let lhs = &lhs[row_idx * k..(row_idx + 1) * k];
-        let lhs_f32: Vec<_> = lhs.iter().map(|&x| x.to_f32()).collect();
-        T::VecDotType::from_float(&lhs_f32, lhs_b);
-    }
-    let lhs_b = lhs_b.as_slice();
+    let elem_size = std::mem::size_of::<T::VecDotType>();
+    // Required scratch buffer length in u64
+    let required_scratch_len = (m * k_in_blocks * elem_size).div_ceil(8);
 
-    for row_idx in 0..m {
-        let lhs_row = &lhs_b[row_idx * k_in_lhs_blocks..(row_idx + 1) * k_in_lhs_blocks];
-        let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
-
-        for (col_idx, dst) in dst_row.iter_mut().enumerate() {
-            let rhs_col = &rhs_t[col_idx * k_in_rhs_blocks..(col_idx + 1) * k_in_rhs_blocks];
-            let value = T::vec_dot(k, rhs_col, lhs_row);
-            *dst = f16::from_f32(value);
+    LHS_F32_SCRATCH.with(|f32_cell| {
+        let mut lhs_f32 = f32_cell.borrow_mut();
+        if lhs_f32.len() < k {
+            lhs_f32.resize(k, 0.0);
         }
-    }
-    Ok(())
+        LHS_SCRATCH.with(|cell| -> Result<()> {
+            let mut scratch = cell.borrow_mut();
+            if scratch.len() < required_scratch_len {
+                scratch.resize(required_scratch_len, 0);
+            }
+            // SAFETY: u64 ensures sufficient alignment. Resize ensures sufficient size.
+            // All elements written before reading.
+            let lhs_b: &mut [T::VecDotType] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    scratch.as_mut_ptr() as *mut T::VecDotType,
+                    m * k_in_blocks,
+                )
+            };
+            for row_idx in 0..m {
+                let lhs_b_mut = &mut lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+                let lhs_row = &lhs[row_idx * k..(row_idx + 1) * k];
+                for (dst, &src) in lhs_f32.iter_mut().zip(lhs_row.iter()) {
+                    *dst = src.to_f32();
+                }
+                T::VecDotType::from_float(&lhs_f32[..k], lhs_b_mut)
+            }
+            let n_quad = n & !3;
+            let quads_total = n_quad / 4;
+            let n_tail = n - n_quad; // 0..=3
+            let pool = crate::utils::barrier_pool();
+            let lhs_b: &[T::VecDotType] = lhs_b;
+            let dst_ptr = dst.as_mut_ptr() as usize;
+            let lhs_row =
+                |row_idx: usize| &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
+
+            // Four dot products of one lhs row against the column quad starting at `col`.
+            // SAFETY (for the raw dst writes below): every (row, column) of dst is written by
+            // exactly one work item, so concurrent workers never touch the same element.
+            let dot_quad = |row_idx: usize, col: usize| {
+                let (d0, d1, d2, d3) = T::vec_dot_4(
+                    k,
+                    &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
+                    &rhs_t[(col + 1) * k_in_blocks..(col + 2) * k_in_blocks],
+                    &rhs_t[(col + 2) * k_in_blocks..(col + 3) * k_in_blocks],
+                    &rhs_t[(col + 3) * k_in_blocks..(col + 4) * k_in_blocks],
+                    lhs_row(row_idx),
+                );
+                unsafe {
+                    let base = (dst_ptr as *mut f16).add(row_idx * n + col);
+                    *base = f16::from_f32(d0);
+                    *base.add(1) = f16::from_f32(d1);
+                    *base.add(2) = f16::from_f32(d2);
+                    *base.add(3) = f16::from_f32(d3);
+                }
+            };
+            // The 0..=3 columns left over after the quads.
+            let dot_tail = |row_idx: usize| {
+                let dst_row = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (dst_ptr as *mut f16).add(row_idx * n + n_quad),
+                        n_tail,
+                    )
+                };
+                if n_tail >= 2 {
+                    let col = n_quad;
+                    let (d0, d1) = T::vec_dot_2(
+                        k,
+                        &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
+                        &rhs_t[(col + 1) * k_in_blocks..(col + 2) * k_in_blocks],
+                        lhs_row(row_idx),
+                    );
+                    dst_row[0] = f16::from_f32(d0);
+                    dst_row[1] = f16::from_f32(d1);
+                }
+                if n_tail & 1 == 1 {
+                    let col = n - 1;
+                    dst_row[n_tail - 1] = f16::from_f32(T::vec_dot(
+                        k,
+                        &rhs_t[col * k_in_blocks..(col + 1) * k_in_blocks],
+                        lhs_row(row_idx),
+                    ));
+                }
+            };
+
+            if m == 1 {
+                // Decode: a single row, the column quads are split across the pool.
+                let dot_range = |range: std::ops::Range<usize>| {
+                    for quad_idx in range {
+                        dot_quad(0, quad_idx * 4)
+                    }
+                };
+                if cfg!(target_arch = "x86_64") && T::DTYPE == GgmlDType::Q6K {
+                    // Compact Q6K GEMV has equal-sized dot products; static ranges
+                    // avoid the shared cursor overhead on this short decode path.
+                    pool.execute_static(quads_total, dot_range);
+                } else {
+                    pool.execute_chunked(quads_total, dot_range);
+                }
+                dot_tail(0);
+                return Ok(());
+            }
+
+            // Prefill: the work items are (row tile, column quad) pairs, row tile major, so that
+            // a worker walking a range of items keeps one tile of quantized lhs rows hot in L1
+            // and reads each weight quad once per tile instead of once per row.
+            let row_tiles = m.div_ceil(MATMUL_ROW_TILE);
+            pool.execute_chunked(row_tiles * quads_total, |range| {
+                for item in range {
+                    let row_start = (item / quads_total) * MATMUL_ROW_TILE;
+                    let row_end = m.min(row_start + MATMUL_ROW_TILE);
+                    let col = (item % quads_total) * 4;
+                    for row_idx in row_start..row_end {
+                        dot_quad(row_idx, col)
+                    }
+                }
+            });
+            if n_tail > 0 {
+                pool.execute_chunked(m, |rows| {
+                    for row_idx in rows {
+                        dot_tail(row_idx)
+                    }
+                });
+            }
+            Ok(())
+        })
+    })
 }
 
 impl GgmlType for f32 {
