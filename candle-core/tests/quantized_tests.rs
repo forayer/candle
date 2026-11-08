@@ -1739,8 +1739,7 @@ fn matmul_f16_batched_rows_match_single_row_and_f32_cpu() -> Result<()> {
                         .apply_op1_no_bwd(&qtensor)?
                         .to_dtype(DType::F32)?
                         .to_vec2::<f32>()?;
-                    let reference_f32 =
-                        lhs_f32.apply_op1_no_bwd(&qtensor)?.to_vec2::<f32>()?;
+                    let reference_f32 = lhs_f32.apply_op1_no_bwd(&qtensor)?.to_vec2::<f32>()?;
 
                     #[allow(clippy::needless_range_loop)] // row_idx is also used for `narrow`
                     for row_idx in 0..m {
