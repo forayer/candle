@@ -536,6 +536,18 @@ impl ModelWeights {
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        let l = input.dim(1)?;
+        let logits = self.forward_all_logits(input, offset)?;
+        logits.narrow(1, l - 1, 1)?.squeeze(1)
+    }
+
+    /// Like [`Self::forward`], but returns logits for *every* position in
+    /// `input`, shape `(b, l, vocab)`, instead of narrowing to just the
+    /// last one. Used by speculative decoding's draft-verification step,
+    /// which needs each draft token's own logits to check it against what
+    /// the verifier model would have sampled at that position — not just
+    /// the position after the whole draft sequence.
+    pub fn forward_all_logits(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (_b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
@@ -556,8 +568,7 @@ impl ModelWeights {
         }
         let h = self.norm.forward(&h)?;
         let _enter = self.span_output.enter();
-        let last_hidden = h.narrow(1, l - 1, 1)?;
-        self.lm_head.forward(&last_hidden)?.squeeze(1)
+        self.lm_head.forward(&h)
     }
 
     pub fn clear_kv_cache(&mut self) {
